@@ -5,6 +5,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
@@ -79,6 +81,7 @@ def test_backend_verification_locks_both_trace_expectations_and_secret(monkeypat
         run_id="respan-v0a-agent-test",
         trace_id="a" * 32,
         agent_checkout_root=checkout,
+        preflight=SimpleNamespace(approved_agent_model="claude-sonnet-4-20250514"),
     )
 
     report = smoke._verify_backend_traces(
@@ -100,6 +103,7 @@ def test_backend_verification_locks_both_trace_expectations_and_secret(monkeypat
     assert captured["agent"].trace_id == "a" * 32
     assert captured["agent"].checkout_root == checkout
     assert captured["agent"].sdk_cost_usd == 0.125
+    assert captured["agent"].model == "claude-sonnet-4-20250514"
     assert captured["target"].run_id == "respan-v0a-target-test"
     assert captured["target"].model == TARGET_MODEL
     assert captured["policy"].timeout_seconds == smoke.BACKEND_GATE_TIMEOUT_SECONDS
@@ -233,3 +237,202 @@ def test_entrypoint_maps_backend_availability_and_contract_failures(
 
     monkeypatch.setattr(smoke, "main", raise_redirect)
     assert smoke.entrypoint() == 4
+
+
+class _SmokePreflightReport:
+    def __init__(
+        self,
+        *,
+        started_at: datetime,
+        finished_at: datetime,
+        passed: bool = True,
+    ) -> None:
+        self.started_at = started_at
+        self.finished_at = finished_at
+        self.passed = passed
+        self.paid_canary_performed = False
+        self.approved_agent_model = "claude-sonnet-pinned"
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "schema_version": "respan-gateway-preflight/v1",
+            "passed": self.passed,
+            "started_at": self.started_at.isoformat(),
+            "finished_at": self.finished_at.isoformat(),
+            "attempts": 1,
+            "paid_canary_performed": self.paid_canary_performed,
+            "checks": [
+                {
+                    "role": "orchestration",
+                    "code": "P_ROUTE_READY",
+                    "status": "pass" if self.passed else "fail",
+                    "resolved_model": self.approved_agent_model,
+                }
+            ],
+        }
+
+
+class _SmokeBackendReport:
+    passed = True
+
+    @staticmethod
+    def to_dict() -> dict[str, object]:
+        return {
+            "schema_version": "respan-v0-backend-trace-gate/v1",
+            "passed": True,
+            "agent_trace_id": "a" * 32,
+            "target_trace_id": "b" * 32,
+            "checks": [],
+        }
+
+
+def _smoke_session_result(
+    preflight: _SmokePreflightReport,
+    *,
+    agent_started_at: datetime,
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        summary="applied deterministic integration",
+        trace_id="a" * 32,
+        trace_url=(
+            "https://platform.respan.ai/platform/traces?trace_unique_id=" + "a" * 32
+        ),
+        run_id="respan-v0a-agent-smoke-test",
+        agent_session_id="session-smoke-test",
+        telemetry_flushed=True,
+        num_turns=2,
+        duration_ms=250,
+        total_cost_usd=0.1,
+        changed_files=["app.py", "requirements.txt"],
+        diff="diff --git a/app.py b/app.py\n",
+        agent_checkout_root=Path("/private/tmp/respan-smoke-agent-checkout"),
+        preflight=preflight,
+        agent_started_at=agent_started_at,
+        pr=None,
+    )
+
+
+def test_smoke_success_evidence_includes_preflight_and_proves_timestamp_order(
+    monkeypatch, capsys
+):
+    base = datetime(2026, 8, 23, 2, 0, tzinfo=timezone.utc)
+    preflight = _SmokePreflightReport(
+        started_at=base + timedelta(seconds=1),
+        finished_at=base + timedelta(seconds=2),
+    )
+    result = _smoke_session_result(
+        preflight, agent_started_at=base + timedelta(seconds=3)
+    )
+    events: list[str] = []
+
+    class FrozenDatetime:
+        calls = 0
+
+        @classmethod
+        def now(cls, tz=None):
+            value = base + timedelta(seconds=cls.calls * 10)
+            cls.calls += 1
+            return value
+
+    def fake_run_session(*_args, **_kwargs):
+        events.append("session")
+        return result
+
+    def fake_run(args, **_kwargs):
+        if args[-1] == "app.py":
+            events.append("target")
+            return subprocess.CompletedProcess(args, 0, "SMOKE_OK\n", "")
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    def fake_backend(**_kwargs):
+        events.append("backend")
+        return _SmokeBackendReport()
+
+    monkeypatch.setattr(smoke, "datetime", FrozenDatetime)
+    monkeypatch.setattr(smoke, "_respan_api_key", lambda: "sentinel-secret")
+    monkeypatch.setattr(smoke, "_init_fixture_repo", lambda _path: "c" * 40)
+    monkeypatch.setattr(smoke, "run_session", fake_run_session)
+    monkeypatch.setattr(smoke, "_run", fake_run)
+    monkeypatch.setattr(smoke, "verify_integration", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(smoke, "_validate_target_then_backend", fake_backend)
+
+    assert smoke.main() == 0
+    stdout = capsys.readouterr().out
+    evidence = json.loads(stdout.split("\n\n--- accepted patch ---", 1)[0])
+
+    assert events == ["session", "target", "backend"]
+    assert evidence["gateway_preflight"] == preflight.to_dict()
+    assert evidence["gateway_preflight"]["passed"] is True
+    assert evidence["gateway_preflight"]["paid_canary_performed"] is False
+    assert evidence["agent_started_at"] == result.agent_started_at.isoformat()
+    assert (
+        datetime.fromisoformat(evidence["gateway_preflight"]["finished_at"])
+        <= datetime.fromisoformat(evidence["agent_started_at"])
+        <= datetime.fromisoformat(evidence["capture_finished_at"])
+    )
+    serialized = json.dumps(evidence, sort_keys=True)
+    assert "sentinel-secret" not in serialized
+    assert "response_body" not in serialized
+
+
+@pytest.mark.parametrize(
+    ("passed", "preflight_finished_offset"),
+    [(False, 2), (True, 4)],
+    ids=["nonpassing-report", "preflight-finishes-after-agent-start"],
+)
+def test_smoke_rejects_bad_preflight_before_target_or_backend(
+    monkeypatch, passed, preflight_finished_offset
+):
+    base = datetime(2026, 8, 23, 3, 0, tzinfo=timezone.utc)
+    preflight = _SmokePreflightReport(
+        started_at=base + timedelta(seconds=1),
+        finished_at=base + timedelta(seconds=preflight_finished_offset),
+        passed=passed,
+    )
+    result = _smoke_session_result(
+        preflight, agent_started_at=base + timedelta(seconds=3)
+    )
+    calls = {"session": 0, "target": 0, "backend": 0}
+
+    class FrozenDatetime:
+        calls = 0
+
+        @classmethod
+        def now(cls, tz=None):
+            value = base + timedelta(seconds=cls.calls * 10)
+            cls.calls += 1
+            return value
+
+    def fake_run_session(*_args, **_kwargs):
+        calls["session"] += 1
+        return result
+
+    def fake_run(args, **_kwargs):
+        if args[-1] == "app.py":
+            calls["target"] += 1
+            return subprocess.CompletedProcess(args, 0, "SMOKE_OK\n", "")
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    def fake_backend(**_kwargs):
+        calls["backend"] += 1
+        return _SmokeBackendReport()
+
+    monkeypatch.setattr(smoke, "datetime", FrozenDatetime)
+    monkeypatch.setattr(smoke, "_respan_api_key", lambda: "sentinel-secret")
+    monkeypatch.setattr(smoke, "_init_fixture_repo", lambda _path: "c" * 40)
+    monkeypatch.setattr(smoke, "run_session", fake_run_session)
+    monkeypatch.setattr(smoke, "_run", fake_run)
+    monkeypatch.setattr(smoke, "verify_integration", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(smoke, "_validate_target_then_backend", fake_backend)
+
+    raised: BaseException | None = None
+    return_code: int | None = None
+    try:
+        return_code = smoke.main()
+    except BaseException as error:  # production may raise a typed preflight error
+        raised = error
+
+    assert calls["session"] == 1
+    assert raised is not None or return_code not in (None, 0)
+    assert calls["target"] == 0
+    assert calls["backend"] == 0

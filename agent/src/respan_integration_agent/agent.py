@@ -15,6 +15,12 @@ from .skill import ProvisionedSkill, provision_respan_skill
 
 
 DEFAULT_RESPAN_BASE_URL = "https://api.respan.ai/api"
+# Use the full model name accepted by Claude Code instead of the mutable
+# ``sonnet`` alias so preflight and execution approve the same route.
+DEFAULT_AGENT_MODEL = "claude-sonnet-4-20250514"
+DEFAULT_AGENT_MAX_TURNS = 40
+DEFAULT_AGENT_MAX_BUDGET_USD = 1.0
+DEFAULT_AGENT_TIMEOUT_SECONDS = 300.0
 
 
 class AgentRunError(RuntimeError):
@@ -97,10 +103,21 @@ def _build_prompt(
         )
     if req.product in (Product.gateway, Product.both) and req.gateway:
         gateway = req.gateway
-        lines.append(
-            f"GATEWAY: funding={gateway.funding.value}, providers={gateway.providers or 'openai-compatible'}, "
-            f"caching={gateway.enable_caching}, fallbacks={gateway.enable_fallbacks}."
+        routes = ", ".join(
+            f"{route.operation.value}[provider={route.provider},model={route.model}]"
+            for route in gateway.routes
         )
+        fallbacks = ", ".join(
+            f"{route.operation.value}[provider={route.provider},model={route.model}]"
+            for route in gateway.fallback_routes
+        )
+        lines.append(
+            f"GATEWAY: funding={gateway.funding.value}, "
+            f"required_credit_usd={gateway.required_credit_usd:g}, "
+            f"caching={gateway.enable_caching}."
+        )
+        lines.append(f"  Exact primary routes, in order: {routes}.")
+        lines.append(f"  Exact fallback routes, in order: {fallbacks or 'none'}.")
 
     if (
         req.verification
@@ -260,10 +277,10 @@ def run_agent(
     *,
     respan_api_key: str,
     respan_base_url: str = DEFAULT_RESPAN_BASE_URL,
-    model: str = "sonnet",
-    max_turns: int = 40,
-    max_budget_usd: float = 1.0,
-    timeout_seconds: float = 300.0,
+    model: str = DEFAULT_AGENT_MODEL,
+    max_turns: int = DEFAULT_AGENT_MAX_TURNS,
+    max_budget_usd: float = DEFAULT_AGENT_MAX_BUDGET_USD,
+    timeout_seconds: float = DEFAULT_AGENT_TIMEOUT_SECONDS,
     run_id: str | None = None,
 ) -> AgentResult:
     """Run one isolated, traced turn and complete its local telemetry flush."""

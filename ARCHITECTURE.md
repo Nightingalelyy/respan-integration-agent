@@ -52,7 +52,8 @@ The agent implements against a config, not mid-run guesses. A pre-scan pre-fills
   Auto (`Respan()`, flat) or Full (framework instrumentor + optional `@workflow`/`@task`
   decorators; which workflows) · env/service tags · endpoint
 - **Gateway** (prep required first, else routed calls fail): funding = **Add credits** or
-  **BYOK** · which providers/models · caching / fallbacks · repoint `base_url`
+  **BYOK** · exact operation/provider/model primary routes · ordered exact fallback
+  routes · explicit credit reserve · caching · repoint `base_url`
 
 ## Reuse (not rebuilt)
 

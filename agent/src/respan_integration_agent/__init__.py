@@ -3,6 +3,8 @@
 from .config import (
     GatewayConfig,
     GatewayFunding,
+    GatewayOperation,
+    GatewayRoute,
     OnboardingRequest,
     Product,
     TracingConfig,
@@ -19,6 +21,8 @@ __all__ = [
     "TracingMode",
     "GatewayConfig",
     "GatewayFunding",
+    "GatewayOperation",
+    "GatewayRoute",
     "VerificationConfig",
     "VerificationProfile",
     "run_session",

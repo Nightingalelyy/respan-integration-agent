@@ -9,6 +9,7 @@ from typing import Any
 
 import pytest
 
+from respan_integration_agent.agent import DEFAULT_AGENT_MODEL
 from respan_integration_agent.platform import (
     BackendNotFoundError,
     BackendRateLimitError,
@@ -137,7 +138,7 @@ def _agent_payload() -> dict[str, Any]:
         metadata=chat_metadata,
         input_value=json.dumps(prompt),
         output_value=json.dumps({"summary": "integrated"}),
-        model="sonnet",
+        model=DEFAULT_AGENT_MODEL,
     )
     tool_specs = [
         (3, "Skill", {"skill": "respan", "args": ""}),
@@ -355,6 +356,12 @@ def _expectations(*, checkout_root: Path | None = CHECKOUT):
             smoke_finished_at=FINISH,
         ),
     )
+
+
+def test_agent_trace_expectation_uses_the_pinned_execution_model_by_default():
+    agent, _ = _expectations()
+
+    assert agent.model == DEFAULT_AGENT_MODEL
 
 
 def _run_gate(

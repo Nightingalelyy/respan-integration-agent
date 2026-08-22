@@ -3,11 +3,17 @@ from types import SimpleNamespace
 import pytest
 
 from respan_integration_agent.agent import (
+    DEFAULT_AGENT_MODEL,
     DEFAULT_RESPAN_BASE_URL,
     AgentRunError,
     _validate_terminal_result,
     _validated_respan_base_url,
 )
+
+
+def test_orchestration_model_is_a_pinned_full_model_name():
+    assert DEFAULT_AGENT_MODEL == "claude-sonnet-4-20250514"
+    assert DEFAULT_AGENT_MODEL != "sonnet"
 
 
 def _result(**overrides):

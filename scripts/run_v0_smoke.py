@@ -32,6 +32,12 @@ EVIDENCE_SCHEMA_VERSION = "respan-v0-smoke-evidence/v1"
 sys.path.insert(0, str(AGENT_SRC))
 
 from respan_integration_agent.config import OnboardingRequest  # noqa: E402
+from respan_integration_agent.gateway_preflight import (  # noqa: E402
+    PreflightDeadlineError,
+    PreflightError,
+    PreflightRateLimitError,
+    PreflightTransportError,
+)
 from respan_integration_agent.platform import (  # noqa: E402
     BackendError,
     BackendRedirectError,
@@ -151,6 +157,7 @@ def _verify_backend_traces(
             smoke_finished_at=smoke_finished_at,
             sdk_cost_usd=result.total_cost_usd,
             checkout_root=result.agent_checkout_root,
+            model=result.preflight.approved_agent_model,
             respan_ai_version=RESPAN_AI_VERSION,
             openai_otel_version=OPENAI_OTEL_VERSION,
         ),
@@ -245,6 +252,39 @@ def _backend_exit_code(error: BackendError | TraceGateError) -> int:
     return 4
 
 
+def _preflight_failure_evidence(error: PreflightError) -> dict[str, object]:
+    """Return a versioned failure without reflecting HTTP or credential material."""
+
+    return {
+        "schema_version": EVIDENCE_SCHEMA_VERSION,
+        "verdict": "GATEWAY_PREFLIGHT_FAILED",
+        "preflight_error": error.as_dict(),
+    }
+
+
+def _preflight_exit_code(error: PreflightError) -> int:
+    if isinstance(
+        error,
+        (PreflightDeadlineError, PreflightRateLimitError, PreflightTransportError),
+    ):
+        return 3
+    return 4
+
+
+def _validate_preflight_timing(result, smoke_started_at: datetime) -> None:
+    """Prove the sanitized readiness pass happened before agent execution."""
+
+    report = result.preflight
+    if not report.passed or report.paid_canary_performed:
+        raise RuntimeError("gateway preflight did not return a non-paid pass")
+    if report.started_at < smoke_started_at:
+        raise RuntimeError("gateway preflight timestamp predates the smoke run")
+    if report.finished_at < report.started_at:
+        raise RuntimeError("gateway preflight timestamps are reversed")
+    if report.finished_at > result.agent_started_at:
+        raise RuntimeError("agent execution began before gateway preflight completed")
+
+
 def main() -> int:
     api_key = _respan_api_key()
     suffix = uuid.uuid4().hex[:12]
@@ -298,6 +338,7 @@ def main() -> int:
             )
         finally:
             runner_module.run_agent = original_run_agent
+        _validate_preflight_timing(result, started_at)
 
         shutil.copytree(FIXTURE, patched)
         _init_fixture_repo(patched)
@@ -382,8 +423,10 @@ def main() -> int:
             "agent_turns": result.num_turns,
             "agent_cost_usd": result.total_cost_usd,
             "agent_base_url": AGENT_BASE_URL,
+            "agent_started_at": result.agent_started_at.isoformat(),
             "telemetry_flushed": result.telemetry_flushed,
             "changed_files": result.changed_files,
+            "gateway_preflight": result.preflight.to_dict(),
             "target_run_id": target_run_id,
             "target_stdout": target.stdout.strip(),
             "target_base_url": TARGET_BASE_URL,
@@ -406,6 +449,12 @@ def entrypoint() -> int:
     """Map backend availability and contract failures to stable CLI exit classes."""
     try:
         return main()
+    except PreflightError as error:
+        print(
+            json.dumps(_preflight_failure_evidence(error), sort_keys=True),
+            file=sys.stderr,
+        )
+        return _preflight_exit_code(error)
     except (TraceGateError, BackendError) as error:
         print(json.dumps(_backend_failure_evidence(error), sort_keys=True), file=sys.stderr)
         return _backend_exit_code(error)

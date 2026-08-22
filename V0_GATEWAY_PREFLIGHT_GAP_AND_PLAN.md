@@ -1,13 +1,14 @@
 # v0 gateway readiness preflight — gap analysis and plan
 
 - Audit date: 2026-08-22
-- Integration-agent baseline: `e7b3c4342ee7066c629f2813a7f0dd4f5be85c08`
-  plus the current uncommitted trusted-v0a/backend-gate worktree
+- Integration-agent branch baseline: `563edbd` on `v0-checklist-implementation`
+  plus the current gateway-preflight implementation worktree
 - Backend snapshot reviewed: `a4ca953db45f5cda2d06049b71251bf3a4549c6b`
 - Respan SDK/CLI snapshot reviewed: `6eee9fdf3c5917da4f77c83cde8425ea0627d369`
 - Documentation snapshot reviewed: `f7998a5802cdefcd0a6e79620536ab9eed49aa67`
-- Mode: source review and local, credential-free probes only
-- Status: **plan only — no gateway-preflight runtime or backend implementation in this run**
+- Mode: agent-side implementation, offline adversarial validation, one protected direct
+  probe, and one fail-closed smoke attempt
+- Status: **agent side implemented; backend contract not deployed; checklist remains open**
 
 ## Decision
 
@@ -28,13 +29,41 @@ existing reads would create false passes and false failures because they do not 
 the gateway hot path's key, plan, budget, TEAM-plan, route-resolution, and credential
 selection semantics.
 
-Recommended next implementation: first add a sanitized, dry-run
+The agent-side client, immutable route plan, runner ordering, sanitized evidence, and
+offline acceptance matrix are now implemented. The remaining required implementation is
+a sanitized, dry-run
 `POST /api/gateway/readiness/` backend contract that reuses the real gateway decision
-logic without contacting an upstream model. Then add a fail-closed client and immutable
-route plan to this repository. Do not mark the README checkbox complete until a fresh
-smoke proves that the readiness pass happens before checkout/model execution.
+logic without contacting an upstream model. Do not mark the README checkbox complete
+until that contract is deployed and a fresh smoke proves the readiness pass before
+checkout/model execution.
 
-## Current behavior
+## 2026-08-23 implementation result
+
+Implemented in this repository:
+
+- exact primary/fallback target route configuration and strict credits/BYOK reserve
+  semantics;
+- full pinned orchestration model `claude-sonnet-4-20250514`;
+- immutable all-product `PreflightPlan` with stable route check IDs;
+- a direct-TLS, pinned-origin, no-redirect readiness client with strict request/response
+  identity, exact echoed funding threshold, safe typed errors, bounded retries, response
+  cap, and shared deadline;
+- preflight before checkout for every product, plus exact target routes for
+  `gateway|both`;
+- approved plan identity passed into agent execution;
+- sanitized CLI/session/smoke evidence and timestamp ordering;
+- 378 offline tests and a clean Ruff run.
+
+Protected deployment result: the official endpoint returned `404`, represented only as
+`P_REQUEST_REJECTED`. The actual smoke exited `4` with
+`GATEWAY_PREFLIGHT_FAILED` before checkout/model execution. See
+[`V0_GATEWAY_PREFLIGHT_IMPLEMENTATION_2026-08-23.md`](V0_GATEWAY_PREFLIGHT_IMPLEMENTATION_2026-08-23.md).
+
+Therefore PF-01, PF-02, PF-03, PF-05, PF-07, and the agent-side portion of PF-08 are
+implemented. PF-04 remains the completion blocker; PF-06 cannot be live-attested until
+that backend contract exists. PF-09 remains a separate non-goal.
+
+## Pre-implementation behavior
 
 The outer call position is useful, but the check itself is empty:
 
@@ -49,16 +78,17 @@ run_session
        -> Claude sends every product through ".../api/anthropic/"
 ```
 
-Source evidence:
+Historical source evidence at `563edbd` (these observations describe that baseline, not
+the current branch):
 
-- [`runner.py:43-65`](agent/src/respan_integration_agent/runner.py#L43) checks only a
-  nonempty key and the skill, and enters the gateway TODO only for `gateway|both`.
-- [`agent.py:215-225`](agent/src/respan_integration_agent/agent.py#L215) supplies the
+- `agent/src/respan_integration_agent/runner.py:43-65` checked only a
+  nonempty key and the skill, and entered the gateway TODO only for `gateway|both`.
+- `agent/src/respan_integration_agent/agent.py:215-225` supplied the
   Respan key and Anthropic gateway base to Claude for every product.
-- [`agent.py:257-274`](agent/src/respan_integration_agent/agent.py#L257) hides the
-  orchestration model in a `run_agent` default and validates the endpoint only after
+- `agent/src/respan_integration_agent/agent.py:257-274` hid the
+  orchestration model in a `run_agent` default and validated the endpoint only after
   `_preflight` and checkout.
-- [`config.py:57-71`](agent/src/respan_integration_agent/config.py#L57) represents a
+- `agent/src/respan_integration_agent/config.py:57-71` represented a
   funding mode and provider names, but no exact models, gateway operation, or fallback
   routes.
 
@@ -66,20 +96,20 @@ A local probe with a definitely invalid key returned normally from `_preflight` 
 tracing, gateway-with-credits, and gateway-with-BYOK requests. No network request was
 made by that probe.
 
-## Confirmed gaps
+## Confirmed pre-implementation gaps and disposition
 
-| ID | Priority | Gap | Consequence |
-|---|---:|---|---|
-| PF-01 | P0 | Gateway code in `_preflight` is a literal `pass`. | Invalid auth, no funds, or no credential route is discovered only after a model run starts. |
-| PF-02 | P0 | The conditional scope is target-product scope, while the orchestration agent always uses the gateway. | A tracing-only run skips the exact gateway dependency it immediately spends. |
-| PF-03 | P0 | Preflight does not receive the validated origin, protocol, model, or session dollar cap. | It cannot approve the same route that `run_agent` later executes; defaults can drift after approval. |
-| PF-04 | P0 | No authoritative non-paid readiness API exists. | Credit/catalog/integration projections can disagree with the actual gateway decision. |
-| PF-05 | P0 | Target gateway intent is not exact: `providers` has no models or operation, and fallbacks are a boolean. | Exact credits/BYOK/model readiness is unrepresentable and therefore unverifiable. |
-| PF-06 | P1 | Funding source and route usability are conflated. | A successful request can use saved BYOK when `funding=credits`, or managed credentials when the user intended BYOK. |
-| PF-07 | P1 | There is no typed client, immutable report, dependency injection boundary, or redacted error taxonomy. | Tests cannot prove call order or failure behavior; raw HTTP details could reach CLI errors. |
-| PF-08 | P1 | There are no preflight runner, transport, schema, or all-product tests. | A future check can silently regress to fail-open or run after clone/model execution. |
-| PF-09 | P1 | `product=both` selects the tracing reference while the bundled skill requires tracing and gateway setup to be separate passes. | Passing readiness would not make the combined onboarding path semantically correct. This adjacent gap remains separately open. |
-| PF-10 | P2 | The old gap report still describes the pre-change signature and strict-config state. | Reviewers can mistake historical evidence for the current workspace behavior. |
+| ID | Priority | Baseline gap | Consequence | Current disposition |
+|---|---:|---|---|---|
+| PF-01 | P0 | Gateway code in `_preflight` was a literal `pass`. | Invalid auth, no funds, or no credential route was discovered only after a model run started. | **Agent side done** — every run now calls the fail-closed client. |
+| PF-02 | P0 | The conditional scope was target-product scope, while the orchestration agent always uses the gateway. | A tracing-only run skipped the exact gateway dependency it immediately spent. | **Done** — orchestration readiness is required for every product. |
+| PF-03 | P0 | Preflight did not receive the validated origin, protocol, model, or session dollar cap. | It could not approve the same route that `run_agent` later executed. | **Done** — one immutable plan supplies execution. |
+| PF-04 | P0 | No authoritative non-paid readiness API exists. | Credit/catalog/integration projections can disagree with the actual gateway decision. | **OPEN BLOCKER** — the official readiness path returned `404`. |
+| PF-05 | P0 | Target gateway intent used provider names and a fallback boolean, with no exact models or operation. | Exact credits/BYOK/model readiness was unrepresentable. | **Done** — strict ordered route objects replace the ambiguous fields. |
+| PF-06 | P1 | Funding source and route usability were conflated. | A successful request could silently use the wrong funding source. | **Agent enforcement done; live proof blocked** — exact funding and credential-source echoes are required, but need PF-04 deployed. |
+| PF-07 | P1 | There was no typed client, immutable report, injection boundary, or redacted error taxonomy. | Tests could not prove call order or safe failure behavior. | **Done** — hardened client/report/errors and injection boundary are covered offline. |
+| PF-08 | P1 | There were no preflight runner, transport, schema, or all-product tests. | A future check could silently regress to fail-open. | **Agent tests done** — backend contract/no-side-effect tests and successful live acceptance remain. |
+| PF-09 | P1 | `product=both` selected the tracing reference while the bundled skill requires tracing and gateway setup to be separate passes. | Passing readiness would not make the combined onboarding path semantically correct. | **OPEN adjacent gap** — explicitly outside this step. |
+| PF-10 | P2 | The old gap report described the pre-change signature and strict-config state. | Reviewers could mistake historical evidence for current behavior. | **Done here** — historical evidence and current disposition are separated. |
 
 ## Why the existing backend reads are not acceptance
 
@@ -145,9 +175,10 @@ Proposed request shape:
   "schema_version": "respan.gateway-readiness/v1",
   "checks": [
     {
+      "check_id": "orchestration",
       "purpose": "orchestration",
       "operation": "anthropic.messages",
-      "model": "<exact-gateway-model>",
+      "model": "claude-sonnet-4-20250514",
       "provider": "anthropic",
       "funding": "any",
       "required_credit_usd": 1.0
@@ -187,14 +218,16 @@ Proposed safe response shape:
   "ready": true,
   "checks": [
     {
+      "check_id": "orchestration",
       "purpose": "orchestration",
       "operation": "anthropic.messages",
-      "requested_model": "<exact-gateway-model>",
-      "resolved_model": "<resolved-model>",
+      "requested_model": "claude-sonnet-4-20250514",
+      "resolved_model": "claude-sonnet-4-20250514",
       "provider": "anthropic",
       "credential_source": "managed",
       "funding_requested": "any",
       "funding_satisfied": true,
+      "required_credit_usd": 1.0,
       "key_ready": true,
       "limits_ready": true,
       "route_ready": true,
@@ -234,23 +267,23 @@ non-billable, and do not use a generic model canary as evidence for a different 
 The v0 checklist gate itself should use the backend dry run. The subsequent real agent
 and target smoke calls remain the live provider acceptance evidence.
 
-## Agent-side design
+## Implemented agent-side design
 
 ### Modules and data
 
-- Add `gateway_preflight.py` with:
+- Added `gateway_preflight.py` with:
   - immutable `PreflightPlan`, `RouteRequirement`, `PreflightCheck`, and
     `PreflightReport` values;
   - an injectable `GatewayReadinessBackend` protocol;
   - a pinned-origin `RespanGatewayReadinessClient`;
   - a pure, strict response evaluator;
   - safe typed exceptions with stable public codes.
-- Centralize orchestration protocol/model/budget constants. Resolve the current mutable
-  `sonnet` alias to a deliberately pinned gateway model before freezing the plan.
-- Replace `GatewayConfig.providers` with exact route objects, or add required exact
-  routes and deprecate the ambiguous provider-only field. When fallbacks are enabled,
-  require an ordered, nonempty fallback route list.
-- Add the sanitized `PreflightReport` to `SessionResult` and smoke evidence.
+- Centralized orchestration protocol/model/budget constants and replaced the mutable
+  `sonnet` alias with the pinned `claude-sonnet-4-20250514` model before freezing the
+  plan.
+- Replaced `GatewayConfig.providers` with required exact route objects and an ordered
+  fallback route list.
+- Added the sanitized `PreflightReport` to `SessionResult` and smoke evidence.
 - Keep the trace-only [`platform.py`](agent/src/respan_integration_agent/platform.py)
   boundary separate; share only a small hardened HTTP utility if that reduces duplicate
   origin, redirect, proxy, timeout, and response-size code.
@@ -260,9 +293,9 @@ and target smoke calls remain the live provider acceptance evidence.
 ```text
 strict request validation
 -> build immutable route plan
--> validate pinned origin, key syntax, skill, Git/Claude runtime, and temp-root writability
--> orchestration readiness (all products)
--> target-route readiness (gateway/both only)
+-> validate pinned origin, key syntax, and bundled skill
+-> submit orchestration readiness (all products)
+-> include exact target-route readiness (gateway/both only)
 -> return sanitized PREFLIGHT_PASS
 -> checkout
 -> run_agent with the exact approved plan
@@ -270,7 +303,8 @@ strict request validation
 ```
 
 Any preflight failure must leave checkout, `run_agent`, commit, push, and PR call counts
-at zero.
+at zero. Git/Claude runtime and temporary-root readiness remain separate general
+preflight work; they are not represented as completed by this gateway-specific item.
 
 ### Transport and failure policy
 
@@ -287,13 +321,13 @@ at zero.
   integration identifiers, credential metadata, or chained HTTP exception in public
   errors.
 
-Suggested stable agent error families:
+Implemented stable agent error families:
 
-- `P_CONFIG_*`
+- `P_CONFIG_INVALID`
 - `P_AUTH_INVALID`, `P_AUTH_FORBIDDEN`
-- `P_MODEL_NOT_FOUND`, `P_ROUTE_AMBIGUOUS`, `P_OPERATION_UNSUPPORTED`
-- `P_CREDITS_NOT_READY`, `P_BYOK_NOT_READY`, `P_LIMIT_NOT_READY`
-- `P_RATE_LIMITED`, `P_SERVICE_UNAVAILABLE`, `P_TIMEOUT`, `P_TRANSPORT`
+- `P_NOT_READY` with bounded safe reason codes
+- `P_RATE_LIMITED`, `P_TIMEOUT`, `P_TRANSPORT`
+- `P_RESPONSE_TOO_LARGE`, `P_REQUEST_REJECTED`
 - `P_SCHEMA_UNSUPPORTED`, `P_REDIRECT`
 
 ## Test plan
@@ -331,6 +365,10 @@ Suggested stable agent error families:
 
 ### Protected live acceptance
 
+Current result: step 1 reached the official origin but received `404`; the client
+reported only `P_REQUEST_REJECTED`. The real smoke then stopped before checkout or
+generation. Steps 2-5 remain blocked on backend deployment.
+
 1. Probe only the deployed readiness schema with the existing smoke key; sanitize and
    record paths, status classes, schema version, and booleans.
 2. Run one preflight-only tracing request and one gateway/BYOK or gateway/credits fixture
@@ -348,15 +386,22 @@ Suggested sanitized evidence:
   "schema_version": "respan-integration-agent-preflight/v1",
   "verdict": "PREFLIGHT_PASS",
   "paid_canary_performed": false,
+  "passed": true,
+  "approved_agent_model": "claude-sonnet-4-20250514",
+  "attempts": 1,
   "started_at": "...",
   "finished_at": "...",
   "checks": [
     {
+      "check_id": "orchestration",
       "purpose": "orchestration",
       "operation": "anthropic.messages",
-      "model": "<pinned-model>",
+      "requested_model": "claude-sonnet-4-20250514",
+      "resolved_model": "claude-sonnet-4-20250514",
+      "provider": "anthropic",
       "funding": "any",
-      "status": "ready",
+      "required_credit_usd": 1.0,
+      "credential_source": "managed",
       "attempts": 1
     }
   ]
@@ -365,18 +410,19 @@ Suggested sanitized evidence:
 
 ## Implementation sequence
 
-1. **Backend contract** — implement and publish the dry-run readiness endpoint using
-   shared gateway evaluators; add schema/security/no-side-effect tests.
-2. **Exact config and plan** — introduce route objects and centralize the orchestration
-   model/protocol/origin/budget; reject ambiguous gateway configs.
-3. **Agent client** — add the hardened injectable client, pure evaluator, typed errors,
-   bounded retries, and sanitized report.
-4. **Runner integration** — execute orchestration and target checks before checkout and
-   pass the same immutable plan to `run_agent`.
-5. **Evidence and CLI** — add report serialization, safe user remediation, and smoke
-   gating.
-6. **Verification** — run the offline matrix, build/install/Ruff checks, then one fresh
-   protected live smoke and exact backend trace acceptance.
+1. **OPEN — backend contract** — implement and publish the dry-run readiness endpoint
+   using shared gateway evaluators; add schema/security/no-side-effect tests.
+2. **DONE — exact config and plan** — route objects centralize the orchestration
+   model/protocol/origin/budget and reject ambiguous gateway configs.
+3. **DONE — agent client** — the hardened injectable client has a strict evaluator,
+   typed errors, bounded retries, and a sanitized report.
+4. **DONE — runner integration** — orchestration and target checks execute before
+   checkout and the same immutable plan is passed to `run_agent`.
+5. **DONE — evidence and CLI** — report serialization, safe failures, and smoke gating
+   are implemented.
+6. **PARTIAL — verification** — the 378-test offline matrix, Ruff, `pip check`, and the
+   fail-closed deployment probe pass their intended gates. A successful protected smoke
+   and exact backend trace acceptance require step 1 to be deployed first.
 
 ## Definition of done
 

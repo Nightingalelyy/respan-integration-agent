@@ -37,10 +37,22 @@ checklist item is orchestration gateway credits/BYOK readiness preflight; its cu
 source-backed gap analysis and implementation sequence are in
 [`V0_GATEWAY_PREFLIGHT_GAP_AND_PLAN.md`](V0_GATEWAY_PREFLIGHT_GAP_AND_PLAN.md).
 
+## Status update — agent-side gateway readiness
+
+On 2026-08-23, the integration-agent side of that next item was implemented on
+`v0-checklist-implementation`: strict exact target routes, a pinned orchestration model,
+an immutable readiness plan, hardened fail-closed client, pre-checkout runner ordering,
+safe CLI/smoke evidence, and 378 passing offline tests. A protected request to the
+official origin returned `404` because the reviewed/deployed backend does not yet expose
+`POST /api/gateway/readiness/`; the actual smoke therefore exited `4` before checkout or
+model execution. The item remains correctly open. See the
+[`implementation evidence`](V0_GATEWAY_PREFLIGHT_IMPLEMENTATION_2026-08-23.md).
+
 ## Executive result
 
-The repository now has a **workable backend-verified trusted v0a demo**, but it is not
-full v0/v0b release acceptance.
+The `563edbd` baseline has a **workable backend-verified trusted v0a demo**, but the
+current branch intentionally cannot start that paid path until the missing backend
+readiness endpoint is deployed. Neither state is full v0/v0b release acceptance.
 
 - The package builds, installs, imports, and exposes its CLI.
 - The fixed v0a profile cannot report success until the complete patch, fresh target run,
@@ -62,7 +74,7 @@ Recommended milestone naming:
 
 This reconciles the README's v0a/v0b split with the architecture document's stricter definition of v0 success as a real PR plus a real trace.
 
-## Checklist reassessment
+## Original checklist reassessment at `e7b3c43`
 
 | README checklist item | Recorded state | Evidence and remaining gap |
 |---|---|---|

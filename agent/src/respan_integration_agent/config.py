@@ -10,6 +10,7 @@ Mirrors the SDK's own "Auto vs Full" tracing decision and the gateway credits/BY
 from __future__ import annotations
 
 from enum import Enum
+import re
 from typing import Optional
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -61,14 +62,108 @@ class GatewayFunding(str, Enum):
     byok = "byok"
 
 
+class GatewayOperation(str, Enum):
+    """Completion operations the v0 target-gateway path can configure exactly."""
+
+    openai_chat_completions = "openai.chat.completions"
+    anthropic_messages = "anthropic.messages"
+
+
+_GATEWAY_PROVIDER_PATTERN = r"^[a-z0-9](?:[a-z0-9._-]{0,62}[a-z0-9])?$"
+_GATEWAY_MODEL_PATTERN = (
+    r"^[A-Za-z0-9](?:[A-Za-z0-9._:/-]{0,126}[A-Za-z0-9])?$"
+)
+_CREDENTIAL_LIKE_ROUTE_VALUE = re.compile(
+    r"(?i)^(?:(?:sk|rk|pk)-[A-Za-z0-9_-]{20,}|"
+    r"gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})$"
+)
+
+
+class GatewayRoute(StrictModel):
+    """One exact provider/model route, with no credentials or free-form URL."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    operation: GatewayOperation
+    provider: str = Field(
+        min_length=1,
+        max_length=64,
+        pattern=_GATEWAY_PROVIDER_PATTERN,
+    )
+    model: str = Field(
+        min_length=1,
+        max_length=128,
+        pattern=_GATEWAY_MODEL_PATTERN,
+    )
+
+    @model_validator(mode="after")
+    def _validate_route(self) -> "GatewayRoute":
+        if self.operation is GatewayOperation.anthropic_messages and (
+            self.provider != "anthropic"
+        ):
+            raise ValueError(
+                "anthropic.messages routes require provider='anthropic'"
+            )
+        if ".." in self.model or "//" in self.model or "://" in self.model:
+            raise ValueError("gateway model must be a safe model identifier")
+        if _CREDENTIAL_LIKE_ROUTE_VALUE.fullmatch(self.provider) or (
+            _CREDENTIAL_LIKE_ROUTE_VALUE.fullmatch(self.model)
+        ):
+            raise ValueError("gateway routes must not contain credential-like values")
+        return self
+
+    @property
+    def identity(self) -> tuple[GatewayOperation, str, str]:
+        return (self.operation, self.provider, self.model)
+
+
 class GatewayConfig(StrictModel):
-    #: PREP: must be satisfied before implementing, else routed calls fail and the
-    #: onboarding demo shows nothing. The runner verifies this up front.
+    """Exact target routes and the funding readiness required before onboarding."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
     funding: GatewayFunding
-    #: Providers/models to route (e.g. ["openai", "anthropic"]). Empty = OpenAI-compatible passthrough.
-    providers: list[str] = Field(default_factory=list)
+    routes: tuple[GatewayRoute, ...] = Field(min_length=1, max_length=15)
     enable_caching: bool = False
-    enable_fallbacks: bool = False
+    fallback_routes: tuple[GatewayRoute, ...] = Field(
+        default=(),
+        max_length=14,
+    )
+    # Explicit for both modes: credits require a positive bounded reserve, while
+    # BYOK uses the provider account and therefore requires exactly zero Respan credits.
+    required_credit_usd: float = Field(
+        ge=0.0,
+        le=100.0,
+        allow_inf_nan=False,
+        strict=True,
+    )
+
+    @model_validator(mode="after")
+    def _validate_gateway_contract(self) -> "GatewayConfig":
+        if self.funding is GatewayFunding.credits and self.required_credit_usd <= 0:
+            raise ValueError("credits funding requires required_credit_usd > 0")
+        if self.funding is GatewayFunding.byok and self.required_credit_usd != 0:
+            raise ValueError("BYOK funding requires required_credit_usd = 0")
+        if len(self.routes) + len(self.fallback_routes) > 15:
+            raise ValueError("gateway supports at most 15 total target routes in v0")
+
+        primary_identities = [route.identity for route in self.routes]
+        fallback_identities = [route.identity for route in self.fallback_routes]
+        if len(primary_identities) != len(set(primary_identities)):
+            raise ValueError("gateway primary routes must be unique")
+        if len(fallback_identities) != len(set(fallback_identities)):
+            raise ValueError("gateway fallback routes must be unique")
+        if set(primary_identities) & set(fallback_identities):
+            raise ValueError("gateway primary and fallback routes must not overlap")
+
+        primary_operations = {route.operation for route in self.routes}
+        if any(
+            route.operation not in primary_operations for route in self.fallback_routes
+        ):
+            raise ValueError(
+                "each fallback operation must match a configured primary operation"
+            )
+        return self
 
 
 class VerificationProfile(str, Enum):
@@ -96,6 +191,10 @@ class OnboardingRequest(StrictModel):
     def _require_matching_sections(self) -> "OnboardingRequest":
         needs_tracing = self.product in (Product.tracing, Product.both)
         needs_gateway = self.product in (Product.gateway, Product.both)
+        if not needs_tracing and self.tracing is not None:
+            raise ValueError("tracing config is not allowed for gateway-only onboarding")
+        if not needs_gateway and self.gateway is not None:
+            raise ValueError("gateway config is not allowed for tracing-only onboarding")
         if needs_tracing and self.tracing is None:
             self.tracing = TracingConfig()  # sensible default = Auto
         if needs_gateway and self.gateway is None:

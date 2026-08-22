@@ -55,6 +55,12 @@ complete patch, installs the modified target in a fresh environment, runs one re
 gateway-routed target call, then polls the exact agent/target markers and validates every
 backend trace/span record before it can emit `BACKEND_VERIFIED_PASS`.
 
+On `v0-checklist-implementation`, that paid path is now preceded by a fail-closed gateway
+readiness check. The agent-side contract is implemented, but the deployed readiness
+endpoint currently returns `404`; therefore the smoke stops before checkout/model
+execution and the checklist remains open. See the
+[implementation evidence](V0_GATEWAY_PREFLIGHT_IMPLEMENTATION_2026-08-23.md).
+
 `config.json` is an `OnboardingRequest` ([config.py](agent/src/respan_integration_agent/config.py)):
 
 ```json
@@ -70,7 +76,7 @@ backend trace/span record before it can emit `BACKEND_VERIFIED_PASS`.
 - [x] Route the model through the gateway with time, turn, and dollar caps
 - [x] **v0a smoke run** — validated patch + fresh target run + exact agent/target traces ([evidence](V0_SMOKE_RUN_2026-08-21_CORRECTED.md))
 - [x] Automate exact backend trace-content inspection inside the smoke harness ([evidence](V0_SMOKE_RUN_2026-08-22_BACKEND_VERIFIED.md), [plan](V0_BACKEND_TRACE_GATE_PLAN.md))
-- [ ] Gateway preflight: verify credits/BYOK before spending a turn (`runner._preflight`) ([gap analysis and plan](V0_GATEWAY_PREFLIGHT_GAP_AND_PLAN.md))
+- [ ] Gateway preflight: agent-side route/funding gate implemented; backend endpoint deployment and live acceptance remain ([evidence](V0_GATEWAY_PREFLIGHT_IMPLEMENTATION_2026-08-23.md), [plan](V0_GATEWAY_PREFLIGHT_GAP_AND_PLAN.md))
 - [ ] `open_pr`: push branch + create PR via REST (`github.py`) — v0b
 - [ ] Container/VM isolation and safe private-repository credentials before untrusted repos
 

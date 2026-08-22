@@ -21,6 +21,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Literal
 from urllib.parse import quote, quote_plus
 
+from .agent import DEFAULT_AGENT_MODEL
 from .platform import (
     BackendNotFoundError,
     BackendRateLimitError,
@@ -117,7 +118,7 @@ class AgentTraceExpectation:
     root_span_name: str = "workflow"
     service_name: str = "respan-integration-agent"
     environment: str = "onboarding"
-    model: str = "sonnet"
+    model: str = DEFAULT_AGENT_MODEL
     provider_system: str = "anthropic"
     target_service_name: str = "respan-v0a-python-smoke"
     target_environment: str = "smoke"
