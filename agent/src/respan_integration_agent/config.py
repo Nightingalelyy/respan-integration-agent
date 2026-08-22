@@ -12,7 +12,11 @@ from __future__ import annotations
 from enum import Enum
 from typing import Optional
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+
+class StrictModel(BaseModel):
+    model_config = ConfigDict(extra="forbid")
 
 
 class Product(str, Enum):
@@ -31,11 +35,11 @@ class TracingMode(str, Enum):
 
 
 class Endpoint(str, Enum):
-    platform = "platform"        # https://api.respan.ai
+    platform = "platform"  # https://api.respan.ai
     enterprise = "enterprise"
 
 
-class TracingConfig(BaseModel):
+class TracingConfig(StrictModel):
     mode: TracingMode = TracingMode.auto
     #: Full only — add @workflow/@task decorators for nested structure.
     use_decorators: bool = False
@@ -44,7 +48,7 @@ class TracingConfig(BaseModel):
     framework_instrumentor: Optional[str] = None
     #: Full + decorators — which workflows to wrap (function names). Empty = agent decides.
     workflows: list[str] = Field(default_factory=list)
-    environment: Optional[str] = None    # e.g. "production"
+    environment: Optional[str] = None  # e.g. "production"
     service_name: Optional[str] = None
     endpoint: Endpoint = Endpoint.platform
 
@@ -57,7 +61,7 @@ class GatewayFunding(str, Enum):
     byok = "byok"
 
 
-class GatewayConfig(BaseModel):
+class GatewayConfig(StrictModel):
     #: PREP: must be satisfied before implementing, else routed calls fail and the
     #: onboarding demo shows nothing. The runner verifies this up front.
     funding: GatewayFunding
@@ -67,13 +71,26 @@ class GatewayConfig(BaseModel):
     enable_fallbacks: bool = False
 
 
+class VerificationProfile(str, Enum):
+    python_openai_auto_smoke = "python-openai-auto-smoke"
+
+
+class VerificationConfig(StrictModel):
+    """Optional deterministic gate used by the trusted v0a smoke fixture."""
+
+    profile: VerificationProfile
+    respan_ai_version: str = Field(pattern=r"^\d+\.\d+\.\d+$")
+    openai_otel_version: str = Field(pattern=r"^\d+\.\d+\.\d+$")
+
+
 # ── The request ──────────────────────────────────────────────────────────────
-class OnboardingRequest(BaseModel):
+class OnboardingRequest(StrictModel):
     repo_url: str
     base_branch: str = "main"
     product: Product
     tracing: Optional[TracingConfig] = None
     gateway: Optional[GatewayConfig] = None
+    verification: Optional[VerificationConfig] = None
 
     @model_validator(mode="after")
     def _require_matching_sections(self) -> "OnboardingRequest":
@@ -85,4 +102,17 @@ class OnboardingRequest(BaseModel):
             raise ValueError(
                 "gateway onboarding requires a GatewayConfig (funding is a required prep step)"
             )
+        if self.verification is not None:
+            is_python_auto_smoke = (
+                self.verification.profile
+                is VerificationProfile.python_openai_auto_smoke
+            )
+            if is_python_auto_smoke and not (
+                self.product is Product.tracing
+                and self.tracing is not None
+                and self.tracing.mode is TracingMode.auto
+            ):
+                raise ValueError(
+                    "python-openai-auto-smoke verification requires product=tracing and mode=auto"
+                )
         return self

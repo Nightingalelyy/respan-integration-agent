@@ -29,15 +29,21 @@ def main(argv: list[str] | None = None) -> int:
     sub = parser.add_subparsers(dest="cmd", required=True)
     run = sub.add_parser("run", help="onboard a repo (v0a: diff+trace, v0b: +PR)")
     run.add_argument("--repo", help="repo URL (overrides config.repo_url)")
-    run.add_argument("--config", required=True, help="path to an OnboardingRequest JSON")
-    run.add_argument("--token", help="GitHub token (PR scope) — omit for v0a (diff only)")
+    run.add_argument(
+        "--config", required=True, help="path to an OnboardingRequest JSON"
+    )
+    run.add_argument(
+        "--token", help="GitHub token (PR scope) — omit for v0a (diff only)"
+    )
 
     args = parser.parse_args(argv)
 
     respan_api_key = os.environ.get("RESPAN_API_KEY")
     if not respan_api_key:
-        print("error: set RESPAN_API_KEY (the gateway handles the model — no Anthropic key needed)",
-              file=sys.stderr)
+        print(
+            "error: set RESPAN_API_KEY (the gateway handles the model — no Anthropic key needed)",
+            file=sys.stderr,
+        )
         return 2
 
     data = json.loads(open(args.config).read())
@@ -45,11 +51,24 @@ def main(argv: list[str] | None = None) -> int:
         data["repo_url"] = args.repo
     req = OnboardingRequest.model_validate(data)
 
-    result = run_session(req, respan_api_key=respan_api_key, github_token=args.token)
+    try:
+        result = run_session(
+            req, respan_api_key=respan_api_key, github_token=args.token
+        )
+    except Exception as exc:
+        print(f"error: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return 1
 
-    print(f"\nchanged {len(result.changed_files)} file(s): {', '.join(result.changed_files)}")
-    if result.trace_id:
-        print(f"trace:  https://platform.respan.ai  (session {result.trace_id})")
+    print(
+        f"\nchanged {len(result.changed_files)} file(s): {', '.join(result.changed_files)}"
+    )
+    print(f"trace:  {result.trace_url}")
+    print(f"trace id: {result.trace_id}")
+    print(f"run id:   {result.run_id}")
+    print(
+        f"agent:    session={result.agent_session_id} turns={result.num_turns} "
+        f"duration_ms={result.duration_ms} cost_usd={result.total_cost_usd}"
+    )
     if result.pr:
         print(f"PR:     {result.pr.url}")
     else:

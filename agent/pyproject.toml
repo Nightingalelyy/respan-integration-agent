@@ -1,20 +1,21 @@
 [project]
 name = "respan-integration-agent"
 version = "0.0.1"
-description = "Respan onboarding agent — clones a repo, integrates Respan tracing/gateway, opens a PR (dogfoods tracing + gateway + evals)"
+description = "Respan onboarding agent — produces validated integration patches and dogfoods Respan tracing and gateway"
 requires-python = ">=3.11,<3.14"
 dependencies = [
-  "pydantic>=2.6",
-  "claude-agent-sdk>=0.1.58",
-  "respan-ai>=0.1",
-  "respan-instrumentation-claude-agent-sdk>=0.1",
+  "pydantic==2.13.4",
+  "claude-agent-sdk==0.2.143",
+  "respan-ai==4.1.0",
+  "respan-instrumentation-claude-agent-sdk==0.2.0",
+  "opentelemetry-claude-agent-sdk==0.1.4",
 ]
 
 [project.scripts]
 respan-integration-agent = "respan_integration_agent.cli:main"
 
 [project.optional-dependencies]
-dev = ["pytest>=8", "ruff>=0.6"]
+dev = ["pytest==8.4.2", "ruff==0.12.12"]
 
 [build-system]
 requires = ["hatchling"]

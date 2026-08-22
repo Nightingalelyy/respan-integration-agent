@@ -7,6 +7,8 @@ from .config import (
     Product,
     TracingConfig,
     TracingMode,
+    VerificationConfig,
+    VerificationProfile,
 )
 from .runner import SessionResult, run_session
 
@@ -17,6 +19,8 @@ __all__ = [
     "TracingMode",
     "GatewayConfig",
     "GatewayFunding",
+    "VerificationConfig",
+    "VerificationProfile",
     "run_session",
     "SessionResult",
 ]
