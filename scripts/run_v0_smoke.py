@@ -11,6 +11,7 @@ import subprocess
 import sys
 import tempfile
 import uuid
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -32,6 +33,13 @@ EVIDENCE_SCHEMA_VERSION = "respan-v0-smoke-evidence/v1"
 sys.path.insert(0, str(AGENT_SRC))
 
 from respan_integration_agent.config import OnboardingRequest  # noqa: E402
+from respan_integration_agent.delivery import (  # noqa: E402
+    BACKEND_TRACE_EVIDENCE_SCHEMA,
+    REQUIRED_VERIFICATION_CHECKS,
+    PreparedDelivery,
+    RepositoryTarget,
+    VerificationReceipt,
+)
 from respan_integration_agent.gateway_preflight import (  # noqa: E402
     PreflightDeadlineError,
     PreflightError,
@@ -44,7 +52,12 @@ from respan_integration_agent.platform import (  # noqa: E402
     BackendTransportError,
     RespanPlatformClient,
 )
-from respan_integration_agent.runner import run_session  # noqa: E402
+from respan_integration_agent.runner import SessionResult, run_session  # noqa: E402
+from respan_integration_agent.sandbox import (  # noqa: E402
+    _credential_free_git_env,
+    checkout,
+    checkout_head,
+)
 from respan_integration_agent.trace_gate import (  # noqa: E402
     AgentTraceExpectation,
     PollingPolicy,
@@ -52,9 +65,56 @@ from respan_integration_agent.trace_gate import (  # noqa: E402
     TraceDeadlineExceeded,
     TraceGateAvailabilityError,
     TraceGateError,
+    TraceGateReport,
     poll_and_verify_smoke_traces,
 )
 from respan_integration_agent.verify import verify_integration  # noqa: E402
+
+
+@dataclass(frozen=True)
+class AcceptedSmokeRun:
+    """The immutable, payload-bounded result downstream delivery may consume."""
+
+    request: OnboardingRequest
+    result: SessionResult
+    target_run_id: str
+    target_trace_id: str
+    target_trace_url: str
+    backend_verified_at: datetime
+    backend_evidence_schema: str
+    passed_checks: tuple[str, ...]
+    evidence: dict[str, object]
+    prepared_delivery: PreparedDelivery | None
+    verification_receipt: VerificationReceipt | None
+
+
+class ContextualBackendFailure(RuntimeError):
+    """Carry safe trace identifiers while keeping backend payloads out of errors."""
+
+    def __init__(
+        self,
+        error: BackendError | TraceGateError,
+        *,
+        agent_run_id: str,
+        agent_trace_id: str,
+        agent_trace_url: str,
+        target_run_id: str,
+    ) -> None:
+        self.error = error
+        self.agent_run_id = agent_run_id
+        self.agent_trace_id = agent_trace_id
+        self.agent_trace_url = agent_trace_url
+        self.target_run_id = target_run_id
+        super().__init__("backend verification failed")
+
+    def evidence(self) -> dict[str, object]:
+        return _backend_failure_evidence(
+            self.error,
+            agent_run_id=self.agent_run_id,
+            agent_trace_id=self.agent_trace_id,
+            agent_trace_url=self.agent_trace_url,
+            target_run_id=self.target_run_id,
+        )
 
 
 def _read_env_value(path: Path, key: str) -> str | None:
@@ -83,6 +143,29 @@ def _respan_api_key() -> str:
     )
 
 
+def _subprocess_env() -> dict[str, str]:
+    """Allow only process mechanics; never forward credentials or user config."""
+
+    return {
+        "PATH": os.environ.get("PATH", ""),
+        "TMPDIR": os.environ.get("TMPDIR", tempfile.gettempdir()),
+    }
+
+
+def _fingerprint_json(value: object) -> str:
+    try:
+        encoded = json.dumps(
+            value,
+            ensure_ascii=True,
+            allow_nan=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    except (TypeError, ValueError):
+        raise RuntimeError("accepted evidence could not be canonicalized") from None
+    return hashlib.sha256(encoded).hexdigest()
+
+
 def _run(
     args: list[str],
     *,
@@ -94,7 +177,7 @@ def _run(
     return subprocess.run(
         args,
         cwd=cwd,
-        env=env,
+        env=_subprocess_env() if env is None else env,
         input=input_text,
         check=True,
         capture_output=True,
@@ -103,13 +186,45 @@ def _run(
     )
 
 
+def _git_home(path: Path) -> Path:
+    home = path.parent / f".{path.name}-git-home"
+    home.mkdir(mode=0o700, exist_ok=True)
+    home.chmod(0o700)
+    return home
+
+
+def _run_git(
+    args: list[str],
+    *,
+    cwd: Path,
+    input_text: str | None = None,
+) -> subprocess.CompletedProcess[str]:
+    return _run(
+        [
+            "git",
+            "-c",
+            "core.hooksPath=/dev/null",
+            "-c",
+            "commit.gpgSign=false",
+            "-c",
+            "tag.gpgSign=false",
+            "-c",
+            "credential.helper=",
+            *args,
+        ],
+        cwd=cwd,
+        env=_credential_free_git_env(_git_home(cwd)),
+        input_text=input_text,
+    )
+
+
 def _init_fixture_repo(path: Path) -> str:
-    _run(["git", "init", "-b", "main"], cwd=path)
-    _run(["git", "config", "user.name", "respan-v0-smoke"], cwd=path)
-    _run(["git", "config", "user.email", "smoke@respan.ai"], cwd=path)
-    _run(["git", "add", "-A"], cwd=path)
-    _run(["git", "commit", "-m", "baseline smoke fixture"], cwd=path)
-    return _run(["git", "rev-parse", "HEAD"], cwd=path).stdout.strip()
+    _run_git(["init", "-b", "main"], cwd=path)
+    _run_git(["config", "user.name", "respan-v0-smoke"], cwd=path)
+    _run_git(["config", "user.email", "smoke@respan.ai"], cwd=path)
+    _run_git(["add", "-A"], cwd=path)
+    _run_git(["commit", "-m", "baseline smoke fixture"], cwd=path)
+    return _run_git(["rev-parse", "HEAD"], cwd=path).stdout.strip()
 
 
 def _target_env(api_key: str, run_id: str) -> dict[str, str]:
@@ -285,7 +400,28 @@ def _validate_preflight_timing(result, smoke_started_at: datetime) -> None:
         raise RuntimeError("agent execution began before gateway preflight completed")
 
 
-def main() -> int:
+def run_verified_smoke(
+    *,
+    repo_url: str | None = None,
+    base_branch: str = "main",
+    expected_base_commit: str | None = None,
+    delivery_target: RepositoryTarget | None = None,
+) -> AcceptedSmokeRun:
+    """Run through backend acceptance without performing any GitHub mutation."""
+
+    if delivery_target is not None:
+        if (
+            not isinstance(delivery_target, RepositoryTarget)
+            or repo_url != delivery_target.canonical_url
+            or base_branch != delivery_target.base_ref
+            or expected_base_commit is None
+        ):
+            raise RuntimeError("v0b delivery target does not match the smoke source")
+    # The v0b wrapper retains its token only in a local variable. Defensively make
+    # every smoke path credential-free even when this function is called directly.
+    for credential_name in ("RESPAN_GITHUB_TOKEN", "GITHUB_TOKEN", "GH_TOKEN"):
+        os.environ.pop(credential_name, None)
+
     api_key = _respan_api_key()
     suffix = uuid.uuid4().hex[:12]
     agent_run_id = f"respan-v0a-agent-{suffix}"
@@ -296,13 +432,18 @@ def main() -> int:
         root = Path(temp_root)
         source = root / "source"
         patched = root / "patched"
-        shutil.copytree(FIXTURE, source)
-        base_commit = _init_fixture_repo(source)
+        source_base_commit: str | None = None
+        if repo_url is None:
+            shutil.copytree(FIXTURE, source)
+            source_base_commit = _init_fixture_repo(source)
+            resolved_repo_url = str(source)
+        else:
+            resolved_repo_url = repo_url
 
         request = OnboardingRequest.model_validate(
             {
-                "repo_url": str(source),
-                "base_branch": "main",
+                "repo_url": resolved_repo_url,
+                "base_branch": base_branch,
                 "product": "tracing",
                 "tracing": {
                     "mode": "auto",
@@ -335,15 +476,27 @@ def main() -> int:
                 request,
                 respan_api_key=api_key,
                 respan_base_url=AGENT_BASE_URL,
+                expected_base_commit=(
+                    source_base_commit
+                    if source_base_commit is not None
+                    else expected_base_commit
+                ),
             )
         finally:
             runner_module.run_agent = original_run_agent
         _validate_preflight_timing(result, started_at)
+        if source_base_commit is not None and result.base_commit != source_base_commit:
+            raise RuntimeError("session base commit did not match the prepared fixture")
 
-        shutil.copytree(FIXTURE, patched)
-        _init_fixture_repo(patched)
-        _run(["git", "apply", "--check", "-"], cwd=patched, input_text=result.diff)
-        _run(["git", "apply", "-"], cwd=patched, input_text=result.diff)
+        # Replay from the same exact base commit accepted by the runner. Initializing
+        # a second independent fixture commit would not bind target evidence to the
+        # delivery parent even when the files happened to match.
+        with checkout(resolved_repo_url, base_branch) as replay:
+            if checkout_head(replay) != result.base_commit:
+                raise RuntimeError("replay checkout base moved after agent preparation")
+            shutil.copytree(replay, patched)
+        _run_git(["apply", "--check", "-"], cwd=patched, input_text=result.diff)
+        _run_git(["apply", "-"], cwd=patched, input_text=result.diff)
         verify_integration(
             patched,
             request,
@@ -393,30 +546,89 @@ def main() -> int:
                 smoke_finished_at=capture_finished_at,
             )
         except (TraceGateError, BackendError) as error:
-            print(
-                json.dumps(
-                    _backend_failure_evidence(
-                        error,
-                        agent_run_id=result.run_id,
-                        agent_trace_id=result.trace_id,
-                        agent_trace_url=result.trace_url,
-                        target_run_id=target_run_id,
-                    ),
-                    sort_keys=True,
-                ),
-                file=sys.stderr,
-            )
-            return _backend_exit_code(error)
+            raise ContextualBackendFailure(
+                error,
+                agent_run_id=result.run_id,
+                agent_trace_id=result.trace_id,
+                agent_trace_url=result.trace_url,
+                target_run_id=target_run_id,
+            ) from None
+        if not isinstance(backend_report, TraceGateReport):
+            raise RuntimeError("backend trace gate returned an invalid report type")
         if not backend_report.passed:  # defensive: hard gate failures normally raise
             raise RuntimeError("backend trace gate returned a non-passing report")
+        if (
+            backend_report.agent_trace_id != result.trace_id
+            or backend_report.agent_trace_url != result.trace_url
+        ):
+            raise RuntimeError("backend trace gate agent identity did not match")
+        if not backend_report.checks or any(
+            check.status == "fail" for check in backend_report.checks
+        ):
+            raise RuntimeError("backend trace gate checks were incomplete")
+        for required_role in ("agent", "target"):
+            if not any(
+                check.role == required_role and check.status == "pass"
+                for check in backend_report.checks
+            ):
+                raise RuntimeError("backend trace gate role acceptance was incomplete")
         verified_at = datetime.now(timezone.utc)
+        backend_evidence = backend_report.to_dict()
+        backend_schema = backend_evidence.get("schema_version")
+        target_trace_id = backend_evidence.get("target_trace_id")
+        target_trace_url = backend_evidence.get("target_trace_url")
+        if (
+            backend_evidence.get("passed") is not True
+            or backend_schema != BACKEND_TRACE_EVIDENCE_SCHEMA
+        ):
+            raise RuntimeError("backend trace gate evidence schema is invalid")
+        if (
+            not isinstance(target_trace_id, str)
+            or len(target_trace_id) != 32
+            or any(character not in "0123456789abcdef" for character in target_trace_id)
+            or int(target_trace_id, 16) == 0
+        ):
+            raise RuntimeError("backend trace gate target identity is invalid")
+        if target_trace_url != (
+            "https://platform.respan.ai/platform/traces?"
+            f"trace_unique_id={target_trace_id}"
+        ):
+            raise RuntimeError("backend trace gate target link is invalid")
+        passed_checks = REQUIRED_VERIFICATION_CHECKS
+        prepared_delivery: PreparedDelivery | None = None
+        verification_receipt: VerificationReceipt | None = None
+        if delivery_target is not None:
+            prepared_delivery = PreparedDelivery(
+                target=delivery_target,
+                base_sha=result.base_commit,
+                patch=result.diff.encode("utf-8"),
+                changed_paths=tuple(sorted(result.changed_files)),
+                product=request.product.value,
+                config_fingerprint=_fingerprint_json(request.model_dump(mode="json")),
+                agent_run_id=result.run_id,
+                agent_trace_id=result.trace_id,
+                agent_trace_url=result.trace_url,
+            )
+            verification_receipt = VerificationReceipt.for_prepared(
+                prepared_delivery,
+                gateway_report_fingerprint=_fingerprint_json(
+                    result.preflight.to_dict()
+                ),
+                target_run_id=target_run_id,
+                target_trace_id=target_trace_id,
+                target_trace_url=target_trace_url,
+                backend_verified_at=verified_at,
+                backend_evidence_schema=backend_schema,
+                passed_checks=passed_checks,
+            )
+            verification_receipt.validate_for(prepared_delivery)
         evidence = {
             "schema_version": EVIDENCE_SCHEMA_VERSION,
             "verdict": "BACKEND_VERIFIED_PASS",
             "started_at": started_at.isoformat(),
             "capture_finished_at": capture_finished_at.isoformat(),
             "backend_verified_at": verified_at.isoformat(),
-            "base_commit": base_commit,
+            "base_commit": result.base_commit,
             "patch_sha256": hashlib.sha256(result.diff.encode("utf-8")).hexdigest(),
             "agent_run_id": result.run_id,
             "agent_session_id": result.agent_session_id,
@@ -437,11 +649,32 @@ def main() -> int:
             "backend_gate_timeout_seconds": BACKEND_GATE_TIMEOUT_SECONDS,
             "backend_connect_timeout_seconds": BACKEND_CONNECT_TIMEOUT_SECONDS,
             "backend_read_timeout_seconds": BACKEND_READ_TIMEOUT_SECONDS,
-            "backend_gate": backend_report.to_dict(),
+            "backend_gate": backend_evidence,
         }
-        print(json.dumps(evidence, indent=2, sort_keys=True))
-        print("\n--- accepted patch ---")
-        print(result.diff)
+        return AcceptedSmokeRun(
+            request=request,
+            result=result,
+            target_run_id=target_run_id,
+            target_trace_id=target_trace_id,
+            target_trace_url=target_trace_url,
+            backend_verified_at=verified_at,
+            backend_evidence_schema=backend_schema,
+            passed_checks=passed_checks,
+            evidence=evidence,
+            prepared_delivery=prepared_delivery,
+            verification_receipt=verification_receipt,
+        )
+
+
+def main() -> int:
+    try:
+        accepted = run_verified_smoke()
+    except ContextualBackendFailure as failure:
+        print(json.dumps(failure.evidence(), sort_keys=True), file=sys.stderr)
+        return _backend_exit_code(failure.error)
+    print(json.dumps(accepted.evidence, indent=2, sort_keys=True))
+    print("\n--- accepted patch ---")
+    print(accepted.result.diff)
     return 0
 
 
@@ -456,7 +689,10 @@ def entrypoint() -> int:
         )
         return _preflight_exit_code(error)
     except (TraceGateError, BackendError) as error:
-        print(json.dumps(_backend_failure_evidence(error), sort_keys=True), file=sys.stderr)
+        print(
+            json.dumps(_backend_failure_evidence(error), sort_keys=True),
+            file=sys.stderr,
+        )
         return _backend_exit_code(error)
 
 

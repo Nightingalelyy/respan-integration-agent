@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -250,6 +251,7 @@ def _install_happy_runner_fakes(
         return _agent_result()
 
     monkeypatch.setattr(runner, "checkout", fake_checkout)
+    monkeypatch.setattr(runner, "checkout_head", lambda *_args: "c" * 40)
     monkeypatch.setattr(runner, "run_agent", fake_agent)
     monkeypatch.setattr(
         runner,
@@ -286,6 +288,7 @@ def test_preflight_precedes_checkout_and_agent_and_approved_values_are_used(
     assert result.preflight.passed is True
     assert result.agent_started_at.tzinfo is UTC
     assert result.preflight.finished_at <= result.agent_started_at
+    assert result.base_commit == "c" * 40
 
     serialized = json.dumps(result.preflight.to_dict(), sort_keys=True)
     assert "sentinel-secret" not in serialized
@@ -362,10 +365,8 @@ def test_plan_checks_orchestration_for_every_product_and_target_only_when_reques
     ],
     ids=["typed-failure", "nonpassing-report"],
 )
-def test_every_preflight_failure_stops_checkout_agent_commit_and_pr(
-    monkeypatch, backend
-):
-    calls = {"checkout": 0, "agent": 0, "commit": 0, "open_pr": 0}
+def test_every_preflight_failure_stops_checkout_and_agent(monkeypatch, backend):
+    calls = {"checkout": 0, "agent": 0}
 
     @contextmanager
     def forbidden_checkout(*_args: Any, **_kwargs: Any):
@@ -378,27 +379,70 @@ def test_every_preflight_failure_stops_checkout_agent_commit_and_pr(
         "run_agent",
         lambda *_args, **_kwargs: calls.__setitem__("agent", calls["agent"] + 1),
     )
-    monkeypatch.setattr(
-        runner.github,
-        "commit_branch",
-        lambda *_args, **_kwargs: calls.__setitem__("commit", calls["commit"] + 1),
-    )
-    monkeypatch.setattr(
-        runner.github,
-        "open_pr",
-        lambda *_args, **_kwargs: calls.__setitem__("open_pr", calls["open_pr"] + 1),
-    )
-
     with pytest.raises(PreflightError):
         runner.run_session(
             _request(Product.both),
             respan_api_key="sentinel-secret",
-            github_token="github-sentinel-secret",
             gateway_readiness_backend=backend,
         )
 
     assert len(backend.plans) == 1, "failure must come from the readiness check"
-    assert calls == {"checkout": 0, "agent": 0, "commit": 0, "open_pr": 0}
+    assert calls == {"checkout": 0, "agent": 0}
+
+
+def test_run_session_rejects_legacy_github_delivery_before_preflight(monkeypatch):
+    monkeypatch.setattr(
+        runner,
+        "_preflight",
+        lambda *_args, **_kwargs: pytest.fail("legacy delivery reached preflight"),
+    )
+    with pytest.raises(runner.SessionDeliveryDisabledError) as raised:
+        runner.run_session(
+            _request(Product.tracing),
+            respan_api_key="sentinel-secret",
+            github_token="github-sentinel-secret",
+        )
+
+    assert "github-sentinel-secret" not in str(raised.value)
+
+
+def test_expected_base_mismatch_stops_before_agent(monkeypatch):
+    events: list[str] = []
+    backend = RecordingReadinessBackend(events=events)
+    _install_happy_runner_fakes(monkeypatch, events=events)
+    monkeypatch.setattr(runner, "checkout_head", lambda *_args: "c" * 40)
+    monkeypatch.setattr(
+        runner,
+        "run_agent",
+        lambda *_args, **_kwargs: pytest.fail("moved base reached the agent"),
+    )
+
+    with pytest.raises(runner.SessionBaseChangedError):
+        runner.run_session(
+            _request(Product.tracing),
+            respan_api_key="sentinel-secret",
+            expected_base_commit="d" * 40,
+            gateway_readiness_backend=backend,
+        )
+
+    assert events == ["preflight", "checkout"]
+
+
+def test_head_change_after_agent_is_rejected(monkeypatch):
+    events: list[str] = []
+    backend = RecordingReadinessBackend(events=events)
+    _install_happy_runner_fakes(monkeypatch, events=events)
+    heads = iter(("c" * 40, "d" * 40))
+    monkeypatch.setattr(runner, "checkout_head", lambda *_args: next(heads))
+
+    with pytest.raises(RuntimeError, match="HEAD changed"):
+        runner.run_session(
+            _request(Product.tracing),
+            respan_api_key="sentinel-secret",
+            gateway_readiness_backend=backend,
+        )
+
+    assert events == ["preflight", "checkout", "run_agent"]
 
 
 @pytest.mark.parametrize("mutation", ["model", "future_timestamp"])
@@ -514,6 +558,62 @@ def test_cli_config_failure_never_reflects_hostile_route_input(
     assert json.loads(captured.err) == cli._config_failure_evidence()
     assert hostile_value not in captured.err
     assert str(config_path) not in captured.err
+
+
+@pytest.mark.parametrize(
+    "token_args",
+    [
+        ("--token", "github-sentinel-secret"),
+        ("--tok", "github-sentinel-secret"),
+        ("--t=github-sentinel-secret",),
+    ],
+)
+def test_cli_rejects_removed_token_option_without_reflecting_value(
+    monkeypatch, capsys, token_args
+):
+    hostile_token = "github-sentinel-secret"
+    monkeypatch.setattr(
+        cli,
+        "run_session",
+        lambda *_args, **_kwargs: pytest.fail("token option reached run_session"),
+    )
+
+    exit_code = cli.main(["run", "--config", "/not/read", *token_args])
+    captured = capsys.readouterr()
+
+    assert exit_code == 2
+    assert captured.out == ""
+    assert json.loads(captured.err) == cli._config_failure_evidence()
+    assert hostile_token not in captured.err
+
+
+def test_cli_scrubs_all_ambient_github_credentials_before_session(
+    monkeypatch, tmp_path, capsys
+):
+    config_path = tmp_path / "request.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "repo_url": "/private/tmp/trusted-fixture",
+                "product": "tracing",
+                "tracing": {"mode": "auto"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("RESPAN_API_KEY", "sentinel-respan-secret")
+    for name in ("RESPAN_GITHUB_TOKEN", "GITHUB_TOKEN", "GH_TOKEN"):
+        monkeypatch.setenv(name, "sentinel-github-secret")
+
+    def stopped_session(*_args: Any, **_kwargs: Any) -> None:
+        for name in ("RESPAN_GITHUB_TOKEN", "GITHUB_TOKEN", "GH_TOKEN"):
+            assert name not in os.environ
+        raise PreflightAuthenticationError(status_code=401, attempts=1)
+
+    monkeypatch.setattr(cli, "run_session", stopped_session)
+
+    assert cli.main(["run", "--config", str(config_path)]) != 0
+    assert "sentinel-github-secret" not in capsys.readouterr().err
 
 
 def test_cli_unexpected_runtime_failure_never_reflects_exception_text(

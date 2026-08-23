@@ -1,12 +1,9 @@
-"""v0 entrypoint — run a session locally, before the platform UI exists.
+"""v0a entrypoint - prepare and validate a patch without GitHub mutation.
 
     export RESPAN_API_KEY=...            # the only secret needed (gateway handles the model)
 
     # v0a — just integrate + show the diff + emit a trace (no GitHub needed):
     respan-integration-agent run --repo https://github.com/acme/app --config config.json
-
-    # v0b — also open a PR:
-    respan-integration-agent run --repo ... --config config.json --token $GH_TOKEN
 
 `config.json` is an OnboardingRequest (see config.py), e.g.:
 
@@ -77,18 +74,33 @@ def _preflight_exit_code(error: PreflightError) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    raw_argv = list(sys.argv[1:] if argv is None else argv)
+
+    # argparse reflects unknown argument values. Reject the removed plaintext token
+    # option and every abbreviation the old parser accepted before parsing so a
+    # credential is never copied into stderr.
+    def is_legacy_token_option(item: str) -> bool:
+        option = item.split("=", 1)[0]
+        return (
+            option.startswith("--") and len(option) > 2 and "--token".startswith(option)
+        )
+
+    if any(is_legacy_token_option(item) for item in raw_argv):
+        print(json.dumps(_config_failure_evidence(), sort_keys=True), file=sys.stderr)
+        return 2
+
     parser = argparse.ArgumentParser(prog="respan-integration-agent")
     sub = parser.add_subparsers(dest="cmd", required=True)
-    run = sub.add_parser("run", help="onboard a repo (v0a: diff+trace, v0b: +PR)")
+    run = sub.add_parser("run", help="onboard a repo (v0a: diff + trace)")
     run.add_argument("--repo", help="repo URL (overrides config.repo_url)")
     run.add_argument(
         "--config", required=True, help="path to an OnboardingRequest JSON"
     )
-    run.add_argument(
-        "--token", help="GitHub token (PR scope) — omit for v0a (diff only)"
-    )
+    args = parser.parse_args(raw_argv)
 
-    args = parser.parse_args(argv)
+    # v0a never needs these credentials and no descendant should inherit them.
+    for credential_name in ("RESPAN_GITHUB_TOKEN", "GITHUB_TOKEN", "GH_TOKEN"):
+        os.environ.pop(credential_name, None)
 
     respan_api_key = os.environ.get("RESPAN_API_KEY")
     if not respan_api_key:
@@ -106,16 +118,24 @@ def main(argv: list[str] | None = None) -> int:
         if args.repo:
             data["repo_url"] = args.repo
         req = OnboardingRequest.model_validate(data)
-    except (OSError, UnicodeError, json.JSONDecodeError, ValidationError, TypeError, ValueError):
+    except (
+        OSError,
+        UnicodeError,
+        json.JSONDecodeError,
+        ValidationError,
+        TypeError,
+        ValueError,
+    ):
         print(json.dumps(_config_failure_evidence(), sort_keys=True), file=sys.stderr)
         return 2
 
     try:
-        result = run_session(
-            req, respan_api_key=respan_api_key, github_token=args.token
-        )
+        result = run_session(req, respan_api_key=respan_api_key)
     except PreflightError as exc:
-        print(json.dumps(_preflight_failure_evidence(exc), sort_keys=True), file=sys.stderr)
+        print(
+            json.dumps(_preflight_failure_evidence(exc), sort_keys=True),
+            file=sys.stderr,
+        )
         return _preflight_exit_code(exc)
     except Exception:
         print(json.dumps(_runtime_failure_evidence(), sort_keys=True), file=sys.stderr)
@@ -135,11 +155,8 @@ def main(argv: list[str] | None = None) -> int:
         f"agent:    session={result.agent_session_id} turns={result.num_turns} "
         f"duration_ms={result.duration_ms} cost_usd={result.total_cost_usd}"
     )
-    if result.pr:
-        print(f"PR:     {result.pr.url}")
-    else:
-        print("\n--- diff (v0a; pass --token to open a PR) ---")
-        print(result.diff)
+    print("\n--- diff (v0a; GitHub delivery is a separate post-acceptance step) ---")
+    print(result.diff)
     print(f"\n{result.summary}")
     return 0
 

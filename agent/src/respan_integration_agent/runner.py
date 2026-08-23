@@ -1,7 +1,10 @@
-"""Session orchestrator: validate → (prep) → clone → agent → PR.
+"""Session orchestrator: validate -> preflight -> clone -> agent -> accepted patch.
 
 This is the whole loop, and the place cost is capped for v0 (max turns/tokens) until the
 gateway exposes an Anthropic-compatible endpoint the agent can route through.
+
+Remote delivery is deliberately not part of this module. v0b may consume the returned
+patch only after a fresh target run and exact backend trace-content acceptance.
 """
 
 from __future__ import annotations
@@ -11,7 +14,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlencode
 
-from . import github
 from .agent import (
     DEFAULT_AGENT_MAX_BUDGET_USD,
     DEFAULT_AGENT_MODEL,
@@ -33,7 +35,7 @@ from .gateway_preflight import (
     RouteRequirement,
 )
 from .patch import capture_worktree_patch
-from .sandbox import checkout
+from .sandbox import checkout, checkout_head
 from .skill import bundled_skill_dir, validate_skill_source
 from .verify import verify_integration
 
@@ -42,7 +44,15 @@ _ORCHESTRATION_OPERATION = "anthropic.messages"
 _ORCHESTRATION_PROVIDER = "anthropic"
 
 
-@dataclass
+class SessionBaseChangedError(RuntimeError):
+    """The repository base no longer matches the read-only frozen identity."""
+
+
+class SessionDeliveryDisabledError(RuntimeError):
+    """Legacy in-session GitHub delivery is deliberately disabled."""
+
+
+@dataclass(frozen=True)
 class SessionResult:
     summary: str
     trace_id: str
@@ -55,14 +65,15 @@ class SessionResult:
     num_turns: int
     duration_ms: int
     total_cost_usd: float | None
-    changed_files: list[str]
+    changed_files: tuple[str, ...]
     diff: str
+    # Frozen before the agent starts and rechecked after patch verification.
+    base_commit: str
     # Retain the now-disposed checkout's absolute path so the deterministic
     # backend gate can prove every recorded Edit stayed inside that checkout.
     agent_checkout_root: Path
     preflight: PreflightReport
     agent_started_at: datetime
-    pr: github.OpenedPR | None  # None in v0a (no token → no PR, just the diff)
 
 
 @dataclass(frozen=True)
@@ -139,9 +150,7 @@ def _build_preflight_plan(
         raise PreflightConfigurationError() from None
 
 
-def _validate_preflight_report(
-    plan: PreflightPlan, report: object
-) -> PreflightReport:
+def _validate_preflight_report(plan: PreflightPlan, report: object) -> PreflightReport:
     """Keep injected readiness backends behind the same fail-closed boundary."""
 
     if not isinstance(report, PreflightReport) or not report.passed:
@@ -175,9 +184,7 @@ def _validate_preflight_report(
     if report.approved_agent_model != plan.agent_model:
         raise PreflightSchemaError()
     orchestration_check = next(
-        check
-        for check in report.checks
-        if check.purpose is RoutePurpose.orchestration
+        check for check in report.checks if check.purpose is RoutePurpose.orchestration
     )
     if orchestration_check.resolved_model != plan.agent_model:
         raise PreflightSchemaError()
@@ -238,8 +245,13 @@ def run_session(
     respan_api_key: str,
     respan_base_url: str = DEFAULT_RESPAN_BASE_URL,
     github_token: str | None = None,
+    expected_base_commit: str | None = None,
     gateway_readiness_backend: GatewayReadinessBackend | None = None,
 ) -> SessionResult:
+    if github_token is not None:
+        raise SessionDeliveryDisabledError(
+            "GitHub delivery requires the post-acceptance v0b entrypoint"
+        )
     preflight = _preflight(
         req,
         respan_api_key,
@@ -249,9 +261,22 @@ def run_session(
     preflight_returned_at = datetime.now(timezone.utc)
     if preflight.report.finished_at > preflight_returned_at:
         raise PreflightSchemaError()
-    branch = f"respan/onboard-{req.product.value}"
-    title = f"Add Respan {req.product.value} instrumentation"
-    with checkout(req.repo_url, req.base_branch, token=github_token) as workdir:
+    with checkout(req.repo_url, req.base_branch) as workdir:
+        base_commit = checkout_head(workdir)
+        if expected_base_commit is not None:
+            if (
+                not isinstance(expected_base_commit, str)
+                or len(expected_base_commit) != 40
+                or any(
+                    character not in "0123456789abcdef"
+                    for character in expected_base_commit
+                )
+            ):
+                raise SessionBaseChangedError("expected base commit is invalid")
+            if base_commit != expected_base_commit:
+                raise SessionBaseChangedError(
+                    "repository base changed before agent execution"
+                )
         # Claude's subprocess reports the real macOS `/private/var/...` path
         # even when tempfile supplied the `/var/...` symlink spelling.
         agent_checkout_root = workdir.resolve()
@@ -274,10 +299,8 @@ def run_session(
             captured.diff,
             respan_api_key=respan_api_key,
         )
-        pr = None
-        if github_token:  # v0b: deliver as a PR; v0a: just the diff
-            github.commit_branch(workdir, branch, title)
-            pr = github.open_pr(workdir, branch, title, result.summary, github_token)
+        if checkout_head(workdir) != base_commit:
+            raise RuntimeError("checkout HEAD changed during agent execution")
     return SessionResult(
         summary=result.summary,
         trace_id=result.trace_id,
@@ -291,10 +314,10 @@ def run_session(
         num_turns=result.num_turns,
         duration_ms=result.duration_ms,
         total_cost_usd=result.total_cost_usd,
-        changed_files=captured.changed_files,
+        changed_files=tuple(captured.changed_files),
         diff=captured.diff,
+        base_commit=base_commit,
         agent_checkout_root=agent_checkout_root,
         preflight=preflight.report,
         agent_started_at=agent_started_at,
-        pr=pr,
     )

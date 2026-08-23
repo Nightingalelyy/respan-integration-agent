@@ -236,6 +236,8 @@ async def _run(
             "RESPAN_API_KEY": "",
             "OPENAI_API_KEY": "",
             "GITHUB_TOKEN": "",
+            "GH_TOKEN": "",
+            "RESPAN_GITHUB_TOKEN": "",
             "ANTHROPIC_API_KEY": respan_api_key,
             "ANTHROPIC_AUTH_TOKEN": respan_api_key,
             "ANTHROPIC_BASE_URL": f"{respan_base_url}/anthropic/",
