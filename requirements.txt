@@ -1,1 +1,2 @@
 anthropic>=0.40,<1
+respan-ai==4.2.3; python_version >= '3.11' and python_version < '3.14'
